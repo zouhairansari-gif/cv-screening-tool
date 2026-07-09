@@ -12,6 +12,7 @@ Streamlit Community Cloud "Secrets" panel when deployed):
 import json
 import os
 
+import pandas as pd
 import streamlit as st
 
 import screening_core as sc
@@ -80,8 +81,8 @@ with st.expander("⚠️ Handling real candidate data — read before uploading"
         "company's data handling policy."
     )
 
-tab_setup, tab_shortlist, tab_interview, tab_chat = st.tabs(
-    ["1. Setup", "2. Shortlist", "3. Interview guide", "4. Ask questions"]
+tab_setup, tab_shortlist, tab_compare, tab_interview, tab_chat = st.tabs(
+    ["1. Setup", "2. Shortlist", "3. Compare", "4. Interview guide", "5. Ask questions"]
 )
 
 # --- Tab 1: Setup (JD + scoring) -------------------------------------------
@@ -114,13 +115,57 @@ with tab_setup:
 
     if data["criteria"]:
         st.markdown(f"**Current role:** {data['role_title']}")
-        for c in data["criteria"]:
-            st.markdown(f"- **{c['weight']}%** — {c['name']}: _{c['description']}_")
+
+        st.caption("Edit weights, names, or descriptions below if the auto-generated rubric isn't quite right. Weights are automatically rebalanced to sum to 100 when you save.")
+        criteria_df = pd.DataFrame(data["criteria"])[["name", "weight", "description"]]
+        edited_df = st.data_editor(
+            criteria_df, num_rows="dynamic", width='stretch', key="criteria_editor",
+            column_config={"weight": st.column_config.NumberColumn("weight", min_value=0, max_value=100)},
+        )
+
+        if st.button("Save rubric edits"):
+            new_criteria = edited_df.to_dict("records")
+            new_criteria = [c for c in new_criteria if str(c.get("name", "")).strip()]  # drop blank rows
+            if not new_criteria:
+                st.warning("At least one criterion is required.")
+            else:
+                data["criteria"] = sc.normalize_weights(new_criteria)
+                data["candidates"] = []  # rubric changed — old scores no longer apply
+                save_data(data)
+                st.success("Rubric updated. Re-score candidates below to use it.")
+                st.rerun()
 
         if data.get("hard_filters"):
             st.markdown("**Eligibility requirements (pass/fail, not scored):**")
             for f in data["hard_filters"]:
                 st.markdown(f"- **{f['name']}**: {f['requirement']}")
+
+        st.divider()
+        st.subheader("Golden profile (optional)")
+        st.caption(
+            "A holistic 'ideal candidate' description — complements the rubric above by capturing "
+            "career shape and trajectory, not just individual criterion scores."
+        )
+        if st.button("Generate golden profile"):
+            with st.spinner("Generating golden profile..."):
+                gp = sc.generate_golden_profile(
+                    client, data["role_title"], data["jd_text"], data["criteria"], data.get("hard_filters", [])
+                )
+            data["golden_profile"] = gp
+            save_data(data)
+            st.success("Golden profile generated.")
+
+        if data.get("golden_profile"):
+            gp = data["golden_profile"]
+            st.markdown(f"**Summary:** {gp['summary']}")
+            if gp.get("key_indicators"):
+                st.markdown("**Key indicators of a strong fit:**")
+                for k in gp["key_indicators"]:
+                    st.markdown(f"- {k}")
+            if gp.get("red_flags"):
+                st.markdown("**Red flags to watch for:**")
+                for r in gp["red_flags"]:
+                    st.markdown(f"- {r}")
 
         st.divider()
         st.subheader("Add your own requirements (optional)")
@@ -191,7 +236,7 @@ with tab_setup:
                     client, parsed["text"], data["criteria"], data.get("hard_filters", [])
                 )
                 total = sc.weighted_score(scored["scores"], data["criteria"])
-                new_candidates.append({
+                candidate_record = {
                     "filename": uploaded.name,
                     "candidate_name": scored.get("candidate_name") or uploaded.name,
                     "cv_text": parsed["text"],
@@ -199,7 +244,17 @@ with tab_setup:
                     "scores": scored["scores"],
                     "filter_results": scored.get("filter_results", []),
                     "used_ocr": parsed["used_ocr"],
-                })
+                }
+
+                if data.get("golden_profile"):
+                    try:
+                        candidate_record["golden_profile_comparison"] = sc.compare_candidate_to_golden_profile(
+                            client, candidate_record, data["golden_profile"], data["role_title"]
+                        )
+                    except Exception as e:
+                        st.info(f"Golden profile comparison skipped for {candidate_record['candidate_name']}: {e}")
+
+                new_candidates.append(candidate_record)
 
             progress.progress(1.0, text="Done.")
             data["candidates"] = sorted(new_candidates, key=lambda c: c["weighted_score"], reverse=True)
@@ -237,7 +292,51 @@ with tab_shortlist:
                 for s in c["scores"]:
                     st.markdown(f"**{s['score']}/5 — {s['criterion']}**  \n{s['rationale']}")
 
-# --- Tab 3: Interview guide --------------------------------------------------
+                if c.get("golden_profile_comparison"):
+                    comp = c["golden_profile_comparison"]
+                    st.markdown("---")
+                    st.markdown(f"**Golden profile fit: {comp['fit_level']}**  \n{comp['narrative']}")
+                    if comp.get("matches"):
+                        st.markdown("✅ " + " · ".join(comp["matches"]))
+                    if comp.get("gaps"):
+                        st.markdown("❌ " + " · ".join(comp["gaps"]))
+
+                st.markdown("---")
+                pdf_bytes = sc.generate_candidate_pdf(
+                    c, data["role_title"], data["criteria"],
+                    data.get("golden_profile"),
+                    data.get("interview_guide", {}).get(c["candidate_name"]),
+                )
+                st.download_button(
+                    "📄 Download candidate summary (PDF)",
+                    data=pdf_bytes,
+                    file_name=f"{c['candidate_name'].replace(' ', '_')}_summary.pdf",
+                    mime="application/pdf",
+                    key=f"pdf_{c['filename']}",
+                )
+
+# --- Tab 3: Compare -----------------------------------------------------------
+with tab_compare:
+    if not data["candidates"]:
+        st.info("No candidates scored yet — go to the Setup tab.")
+    else:
+        st.subheader("Side-by-side comparison")
+        st.caption("Useful for a calibration conversation — every candidate against every criterion in one view.")
+
+        rows = []
+        for c in data["candidates"]:
+            row = {"Candidate": c["candidate_name"], "Weighted score": c["weighted_score"]}
+            for s in c["scores"]:
+                row[s["criterion"]] = s["score"]
+            if c.get("golden_profile_comparison"):
+                row["Golden profile fit"] = c["golden_profile_comparison"]["fit_level"]
+            not_met = [f["filter"] for f in c.get("filter_results", []) if f["status"] == "not_met"]
+            row["Eligibility"] = ("⚠️ " + ", ".join(not_met)) if not_met else "OK"
+            rows.append(row)
+
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+# --- Tab 4: Interview guide --------------------------------------------------
 with tab_interview:
     if not data["candidates"]:
         st.info("No candidates scored yet — go to the Setup tab.")
@@ -278,7 +377,7 @@ with tab_interview:
                         st.markdown(f"❌ *Weak answer:* {q['weak_answer_signal']}")
                         st.markdown("---")
 
-# --- Tab 4: Chat -------------------------------------------------------------
+# --- Tab 5: Chat -------------------------------------------------------------
 with tab_chat:
     if not data["candidates"]:
         st.info("No candidates scored yet — go to the Setup tab.")
