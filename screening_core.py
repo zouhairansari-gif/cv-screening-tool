@@ -116,12 +116,56 @@ def get_client(api_key):
 
 
 def _extract_json(raw_text):
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```")[1]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    return json.loads(cleaned.strip())
+    """
+    Robustly pulls a JSON object out of a Claude response, even if the model
+    added conversational text before/after it or wrapped it in a code fence
+    that isn't at the very start of the string. Tries, in order:
+    1. Parse the raw text directly (the common case).
+    2. Find a ```json ... ``` or ``` ... ``` fence anywhere in the text.
+    3. Find the first '{' and its matching closing '}' via balanced-brace
+       scanning (handles nested objects correctly, unlike a naive rfind).
+    Raises a clear, specific error if all three fail — e.g. because the
+    response was cut off before finishing (hit the token limit).
+    """
+    raw_text = raw_text.strip()
+
+    # Attempt 1: parse as-is.
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: extract a fenced code block, wherever it appears.
+    import re
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_text)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Attempt 3: balanced-brace scan from the first '{' to its matching '}'.
+    start = raw_text.find("{")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(raw_text)):
+            if raw_text[i] == "{":
+                depth += 1
+            elif raw_text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw_text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+
+    raise ValueError(
+        "Could not parse a valid JSON response from Claude. This usually means the "
+        "response was cut off before finishing (try increasing max_tokens) or the "
+        "model returned something unexpected. Raw response started with:\n"
+        f"{raw_text[:300]}"
+    )
 
 
 def extract_criteria_from_jd(client, jd_text):
@@ -296,7 +340,7 @@ Return ONLY valid JSON in this exact shape:
     }}
   ]
 }}"""
-    response = client.messages.create(model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
+    response = client.messages.create(model=MODEL, max_tokens=2500, messages=[{"role": "user", "content": prompt}])
     return _extract_json(response.content[0].text)["questions"]
 
 
