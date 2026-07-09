@@ -251,14 +251,22 @@ with tab_interview:
 
         if st.button("Generate interview guide"):
             top_candidates = data["candidates"][:top_n]
-            guide = {}
+            guide = data.get("interview_guide", {})
             progress = st.progress(0.0)
+            errors = []
             for i, c in enumerate(top_candidates):
                 progress.progress(i / len(top_candidates), text=f"Generating questions for {c['candidate_name']}...")
-                guide[c["candidate_name"]] = sc.generate_interview_questions(client, c, data["role_title"])
+                try:
+                    guide[c["candidate_name"]] = sc.generate_interview_questions(client, c, data["role_title"])
+                except Exception as e:
+                    errors.append((c["candidate_name"], str(e)))
             progress.progress(1.0, text="Done.")
             data["interview_guide"] = guide
             save_data(data)
+            if errors:
+                for name, err in errors:
+                    st.warning(f"Couldn't generate questions for {name} — try again for just this candidate. ({err[:150]})")
+            st.success(f"Generated questions for {len(top_candidates) - len(errors)}/{len(top_candidates)} candidate(s).")
 
         if data.get("interview_guide"):
             for name, questions in data["interview_guide"].items():
