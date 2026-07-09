@@ -5,3 +5,5 @@ pdfplumber>=0.11
 pytesseract>=0.3.10
 pdf2image>=1.17
 Pillow>=10.0
+pandas>=2.0
+fpdf2>=2.7
