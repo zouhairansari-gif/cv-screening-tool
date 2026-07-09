@@ -366,6 +366,191 @@ Candidate data:
     return answer, messages
 
 
+def generate_golden_profile(client, role_title, jd_text, criteria, hard_filters):
+    """
+    Generates a holistic 'ideal candidate' narrative for the role — complementary
+    to the criterion-by-criterion rubric, not a replacement for it. Captures the
+    shape of a strong career (trajectory, scale, scope) that a list of independent
+    criterion scores can't express on its own.
+    """
+    prompt = f"""You are an experienced HR / talent acquisition partner. Based on the
+job description and screening rubric below, describe the ideal ("golden") candidate
+profile for this role — not a checklist, but the shape of a genuinely strong career
+for this specific role.
+
+Role: {role_title}
+
+Job description:
+{jd_text}
+
+Screening rubric (for context on what already matters):
+{json.dumps(criteria, indent=2)}
+
+Hard eligibility requirements:
+{json.dumps(hard_filters, indent=2)}
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "summary": "2-4 sentences describing the ideal candidate's career shape, trajectory, and scope",
+  "key_indicators": ["specific, concrete signals of a strong match", "..."],
+  "red_flags": ["specific things that would be a concern for this role", "..."]
+}}"""
+    response = client.messages.create(model=MODEL, max_tokens=1200, messages=[{"role": "user", "content": prompt}])
+    return _extract_json(response.content[0].text)
+
+
+def compare_candidate_to_golden_profile(client, candidate, golden_profile, role_title):
+    """
+    Compares one candidate's actual CV against the golden profile narrative —
+    a holistic judgment, distinct from (and complementary to) the per-criterion
+    rubric scores this candidate already has.
+    """
+    prompt = f"""You are comparing a candidate's CV against an ideal ("golden") profile
+for the role of {role_title}.
+
+Golden profile:
+{json.dumps(golden_profile, indent=2)}
+
+Candidate CV text:
+{candidate['cv_text'][:12000]}
+
+Judge the OVERALL shape of this candidate's career against the golden profile — not
+just individual facts, but trajectory, scale, and scope. Be specific and cite CV
+evidence; never invent details not present in the CV.
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "fit_level": "Strong", "Moderate", or "Weak",
+  "matches": ["specific ways this candidate matches the golden profile", "..."],
+  "gaps": ["specific ways this candidate falls short of the golden profile", "..."],
+  "narrative": "2-3 sentences summarizing the overall comparison"
+}}"""
+    response = client.messages.create(model=MODEL, max_tokens=1200, messages=[{"role": "user", "content": prompt}])
+    return _extract_json(response.content[0].text)
+
+
+def normalize_weights(criteria):
+    """
+    After a recruiter manually edits criterion weights, they may no longer sum
+    to exactly 100. This rescales them proportionally so they do, preserving
+    the relative importance the recruiter set rather than silently overriding it.
+    Rounds each weight to a whole number, then adjusts the last item so the
+    total is exactly 100 even after rounding (rounding each independently can
+    otherwise leave the total a fraction off, e.g. 99.9 instead of 100).
+    """
+    total = sum(c["weight"] for c in criteria)
+    if total == 0:
+        # Avoid division by zero — fall back to equal weighting.
+        base = 100 // len(criteria)
+        remainder = 100 - base * len(criteria)
+        return [
+            {**c, "weight": base + (1 if i < remainder else 0)}
+            for i, c in enumerate(criteria)
+        ]
+
+    scaled = [round(c["weight"] * 100 / total) for c in criteria]
+    diff = 100 - sum(scaled)
+    scaled[-1] += diff  # absorb any rounding remainder into the last item
+    return [{**c, "weight": w} for c, w in zip(criteria, scaled)]
+
+
+def _pdf_safe(text):
+    """
+    The default PDF font (Helvetica) only supports Latin-1 characters, but
+    Claude's output commonly includes em-dashes, curly quotes, and similar
+    punctuation that Latin-1 doesn't cover. Replaces the common cases with
+    plain-ASCII equivalents, then strips anything else that still doesn't fit
+    rather than letting the whole PDF generation crash on one character.
+    """
+    if not text:
+        return ""
+    replacements = {
+        "\u2014": "-", "\u2013": "-",       # em dash, en dash
+        "\u2018": "'", "\u2019": "'",       # curly single quotes
+        "\u201c": '"', "\u201d": '"',       # curly double quotes
+        "\u2026": "...",                     # ellipsis
+        "\u2022": "-",                       # bullet
+    }
+    for original, replacement in replacements.items():
+        text = text.replace(original, replacement)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def generate_candidate_pdf(candidate, role_title, criteria, golden_profile=None, interview_questions=None):
+    """
+    Builds a one-page(ish) PDF summary for a single candidate: weighted score,
+    per-criterion rationale, eligibility flags, golden profile comparison (if
+    available), and interview questions (if generated). Returns raw PDF bytes,
+    suitable for st.download_button.
+    """
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _pdf_safe(candidate["candidate_name"]), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(90, 90, 90)
+    pdf.cell(0, 7, _pdf_safe(f"{role_title}  -  Weighted score: {candidate['weighted_score']}/5"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    filter_results = candidate.get("filter_results", [])
+    if filter_results:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Eligibility requirements", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for f in filter_results:
+            status_label = {"met": "MET", "not_met": "NOT MET", "cannot_determine": "VERIFY DIRECTLY"}.get(
+                f["status"], f["status"].upper()
+            )
+            pdf.multi_cell(0, 6, _pdf_safe(f"[{status_label}] {f['filter']}: {f['rationale']}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Criterion scores", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    for s in candidate["scores"]:
+        pdf.multi_cell(0, 6, _pdf_safe(f"[{s['score']}/5] {s['criterion']}: {s['rationale']}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    if golden_profile is not None and candidate.get("golden_profile_comparison"):
+        comp = candidate["golden_profile_comparison"]
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, _pdf_safe(f"Golden profile fit: {comp['fit_level']}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, _pdf_safe(comp["narrative"]), new_x="LMARGIN", new_y="NEXT")
+        if comp.get("matches"):
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, "Matches:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            for m in comp["matches"]:
+                pdf.multi_cell(0, 6, _pdf_safe(f"+ {m}"), new_x="LMARGIN", new_y="NEXT")
+        if comp.get("gaps"):
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, "Gaps:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            for g in comp["gaps"]:
+                pdf.multi_cell(0, 6, _pdf_safe(f"- {g}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    if interview_questions:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Suggested interview questions", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for q in interview_questions:
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.multi_cell(0, 6, _pdf_safe(f"Q: {q['question']}"), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 6, _pdf_safe(f"   Strong answer: {q['strong_answer_signal']}"), new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, 6, _pdf_safe(f"   Weak answer: {q['weak_answer_signal']}"), new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
+    return bytes(pdf.output())
+
+
 def weighted_score(scores, criteria):
     total = sum(
         s["score"] * next(c["weight"] for c in criteria if c["name"] == s["criterion"])
