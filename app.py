@@ -80,7 +80,9 @@ with st.expander("⚠️ Handling real candidate data — read before uploading"
         "company's data handling policy."
     )
 
-tab_setup, tab_shortlist, tab_chat = st.tabs(["1. Setup", "2. Shortlist", "3. Ask questions"])
+tab_setup, tab_shortlist, tab_interview, tab_chat = st.tabs(
+    ["1. Setup", "2. Shortlist", "3. Interview guide", "4. Ask questions"]
+)
 
 # --- Tab 1: Setup (JD + scoring) -------------------------------------------
 with tab_setup:
@@ -115,6 +117,51 @@ with tab_setup:
         for c in data["criteria"]:
             st.markdown(f"- **{c['weight']}%** — {c['name']}: _{c['description']}_")
 
+        if data.get("hard_filters"):
+            st.markdown("**Eligibility requirements (pass/fail, not scored):**")
+            for f in data["hard_filters"]:
+                st.markdown(f"- **{f['name']}**: {f['requirement']}")
+
+        st.divider()
+        st.subheader("Add your own requirements (optional)")
+        st.caption(
+            "Mark something 'Hard requirement' if it should be a pass/fail eligibility check — "
+            "it will never be silently used to rank or exclude candidates by nationality; only explicit "
+            "visa/residency statements in the CV are used for work-authorization checks. Leave it unchecked "
+            "for something that should just raise or lower a candidate's score."
+        )
+
+        req_fields = [
+            ("Industry experience", "e.g. FMCG / consumer goods only"),
+            ("Regional experience", "e.g. GCC or MENA market exposure"),
+            ("Language requirement", "e.g. fluent Arabic and English"),
+            ("Work authorization", "e.g. valid UAE work visa or visa-transferable"),
+        ]
+        requirements = []
+        for label, placeholder in req_fields:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                val = st.text_input(label, placeholder=placeholder, key=f"req_{label}")
+            with col2:
+                is_hard = st.checkbox("Hard requirement", key=f"hard_{label}")
+            if val.strip():
+                requirements.append({"category": label, "requirement": val.strip(), "hard_requirement": is_hard})
+
+        if st.button("Apply requirements to rubric"):
+            if not requirements:
+                st.warning("No requirements entered — nothing to apply.")
+            else:
+                with st.spinner("Merging your requirements into the rubric..."):
+                    merged = sc.merge_requirements_into_rubric(
+                        client, data["role_title"], data["criteria"], requirements
+                    )
+                data["criteria"] = merged["criteria"]
+                data["hard_filters"] = merged["hard_filters"]
+                data["candidates"] = []  # rubric changed — old scores no longer apply
+                save_data(data)
+                st.success("Requirements applied. Re-score candidates below to use the updated rubric.")
+                st.rerun()
+
     st.divider()
     st.subheader("Candidates")
 
@@ -140,7 +187,9 @@ with tab_setup:
                 if parsed["warning"]:
                     st.info(f"{uploaded.name}: {parsed['warning']}")
 
-                scored = sc.score_candidate(client, parsed["text"], data["criteria"])
+                scored = sc.score_candidate(
+                    client, parsed["text"], data["criteria"], data.get("hard_filters", [])
+                )
                 total = sc.weighted_score(scored["scores"], data["criteria"])
                 new_candidates.append({
                     "filename": uploaded.name,
@@ -148,6 +197,7 @@ with tab_setup:
                     "cv_text": parsed["text"],
                     "weighted_score": total,
                     "scores": scored["scores"],
+                    "filter_results": scored.get("filter_results", []),
                     "used_ocr": parsed["used_ocr"],
                 })
 
@@ -162,13 +212,65 @@ with tab_shortlist:
         st.info("No candidates scored yet — go to the Setup tab.")
     else:
         st.subheader(f"Ranked shortlist — {data['role_title']}")
+        st.caption(
+            "Eligibility flags are shown, not hidden — a candidate who fails a hard "
+            "requirement still appears here for you to review and decide."
+        )
         for i, c in enumerate(data["candidates"]):
             ocr_tag = " · OCR used" if c["used_ocr"] else ""
-            with st.expander(f"#{i+1}  {c['candidate_name']}  —  {c['weighted_score']}/5{ocr_tag}"):
+            filter_results = c.get("filter_results", [])
+            not_met = [f for f in filter_results if f["status"] == "not_met"]
+            unclear = [f for f in filter_results if f["status"] == "cannot_determine"]
+            flag_tag = ""
+            if not_met:
+                flag_tag = f"  ⚠️ Fails: {', '.join(f['filter'] for f in not_met)}"
+            elif unclear:
+                flag_tag = f"  ❓ Verify: {', '.join(f['filter'] for f in unclear)}"
+
+            with st.expander(f"#{i+1}  {c['candidate_name']}  —  {c['weighted_score']}/5{ocr_tag}{flag_tag}"):
+                if filter_results:
+                    st.markdown("**Eligibility requirements:**")
+                    for f in filter_results:
+                        icon = {"met": "✅", "not_met": "❌", "cannot_determine": "❓"}.get(f["status"], "•")
+                        st.markdown(f"{icon} **{f['filter']}**: {f['rationale']}")
+                    st.markdown("---")
                 for s in c["scores"]:
                     st.markdown(f"**{s['score']}/5 — {s['criterion']}**  \n{s['rationale']}")
 
-# --- Tab 3: Chat -------------------------------------------------------------
+# --- Tab 3: Interview guide --------------------------------------------------
+with tab_interview:
+    if not data["candidates"]:
+        st.info("No candidates scored yet — go to the Setup tab.")
+    else:
+        st.subheader("Interview guide for top candidates")
+        st.caption(
+            "Questions are targeted at each candidate's specific weak or uncertain scoring areas — "
+            "not generic questions — so you know exactly what to verify in the room."
+        )
+        top_n = st.number_input("How many top candidates?", min_value=1, max_value=10, value=4)
+
+        if st.button("Generate interview guide"):
+            top_candidates = data["candidates"][:top_n]
+            guide = {}
+            progress = st.progress(0.0)
+            for i, c in enumerate(top_candidates):
+                progress.progress(i / len(top_candidates), text=f"Generating questions for {c['candidate_name']}...")
+                guide[c["candidate_name"]] = sc.generate_interview_questions(client, c, data["role_title"])
+            progress.progress(1.0, text="Done.")
+            data["interview_guide"] = guide
+            save_data(data)
+
+        if data.get("interview_guide"):
+            for name, questions in data["interview_guide"].items():
+                with st.expander(f"🎤  {name}"):
+                    for q in questions:
+                        st.markdown(f"**Targets: {q['topic']}**")
+                        st.markdown(f"**Question:** {q['question']}")
+                        st.markdown(f"✅ *Strong answer:* {q['strong_answer_signal']}")
+                        st.markdown(f"❌ *Weak answer:* {q['weak_answer_signal']}")
+                        st.markdown("---")
+
+# --- Tab 4: Chat -------------------------------------------------------------
 with tab_chat:
     if not data["candidates"]:
         st.info("No candidates scored yet — go to the Setup tab.")
