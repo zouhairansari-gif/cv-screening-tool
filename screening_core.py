@@ -143,7 +143,31 @@ Return ONLY valid JSON in this exact shape, with weights summing to 100:
     return _extract_json(response.content[0].text)
 
 
-def score_candidate(client, cv_text, criteria):
+def score_candidate(client, cv_text, criteria, hard_filters=None):
+    hard_filters = hard_filters or []
+
+    filters_section = ""
+    if hard_filters:
+        filters_section = f"""
+
+Also evaluate the candidate against these hard eligibility requirements. These are
+pass/fail gates, separate from the scored criteria above — a candidate can score well
+overall while still failing one of these.
+
+Hard eligibility requirements:
+{json.dumps(hard_filters, indent=2)}
+
+For EACH requirement, return a status of "met", "not_met", or "cannot_determine",
+plus a one-sentence rationale citing specific CV evidence (or noting its absence).
+
+IMPORTANT — for any requirement related to work authorization, visa, or nationality:
+judge ONLY based on explicit statements in the CV about residency or visa status
+(e.g. "holds a valid UAE residence visa," "eligible to work in the UAE without
+sponsorship"). NEVER infer this from the candidate's name, the sound of their name,
+their country of education, or any other proxy for nationality or ethnicity — if the
+CV doesn't explicitly state residency/visa status, mark it "cannot_determine" with the
+rationale "not stated in CV — verify directly with the candidate," rather than guessing."""
+
     prompt = f"""You are scoring a candidate CV against a weighted hiring rubric. Score
 based only on evidence in the CV text below — never on assumptions beyond what's written.
 If a criterion has no supporting evidence, say so explicitly and score it low rather
@@ -157,16 +181,123 @@ Candidate CV text:
 
 For EACH criterion, return a score 1 (no evidence) to 5 (strong evidence), plus a
 one-sentence rationale citing specific CV evidence (or noting its absence).
+{filters_section}
 
 Return ONLY valid JSON in this exact shape:
 {{
   "candidate_name": "best-guess name extracted from the CV, or null if not found",
   "scores": [
     {{"criterion": "...", "score": 1, "rationale": "..."}}
+  ],
+  "filter_results": [
+    {{"filter": "...", "status": "met", "rationale": "..."}}
+  ]
+}}
+(Return an empty list for filter_results if no hard requirements were provided.)"""
+    response = client.messages.create(model=MODEL, max_tokens=1800, messages=[{"role": "user", "content": prompt}])
+    return _extract_json(response.content[0].text)
+
+
+def merge_requirements_into_rubric(client, role_title, base_criteria, requirements):
+    """
+    Takes the JD-derived rubric (base_criteria) plus a recruiter's explicit
+    requirements — each marked by the recruiter as either a hard filter
+    (pass/fail eligibility gate) or a weighted preference (added to the score) —
+    and produces a final merged rubric.
+
+    `requirements` is a list of dicts like:
+        {"category": "Regional experience", "requirement": "GCC region", "hard_requirement": False}
+        {"category": "Work authorization", "requirement": "Valid UAE work visa or transferable", "hard_requirement": True}
+
+    Returns: {"criteria": [...weights summing to 100...], "hard_filters": [...]}
+    """
+    hard_items = [r for r in requirements if r.get("hard_requirement") and r.get("requirement", "").strip()]
+    soft_items = [r for r in requirements if not r.get("hard_requirement") and r.get("requirement", "").strip()]
+
+    # Hard filters don't need an LLM call to define — they're just recorded as-is,
+    # and evaluated per-candidate later in score_candidate(). Keeping this
+    # deterministic (no LLM judgment on what counts as a "filter") avoids the
+    # model quietly reinterpreting a strict requirement as a soft preference.
+    hard_filters = [
+        {"name": r["category"], "requirement": r["requirement"]}
+        for r in hard_items
+    ]
+
+    if not soft_items:
+        # Nothing to merge into the weighted rubric — return the base criteria untouched.
+        return {"criteria": base_criteria, "hard_filters": hard_filters}
+
+    prompt = f"""You are refining a weighted hiring rubric for the role of {role_title}.
+
+Here is the current rubric, derived from the job description:
+{json.dumps(base_criteria, indent=2)}
+
+The recruiter has added these additional preferences to fold in (these are things
+that should raise or lower a candidate's score, not disqualify them outright):
+{json.dumps(soft_items, indent=2)}
+
+Merge these into the rubric:
+- If a new preference clearly overlaps with an existing criterion, adjust that
+  criterion's description rather than creating a near-duplicate.
+- If it's genuinely new, add it as a new criterion.
+- Re-weight ALL criteria (existing and new) so they sum to exactly 100, reflecting
+  reasonable relative importance — don't just default new items to a small weight.
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "criteria": [
+    {{"name": "...", "weight": 25, "description": "..."}}
   ]
 }}"""
     response = client.messages.create(model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
-    return _extract_json(response.content[0].text)
+    merged = _extract_json(response.content[0].text)
+    return {"criteria": merged["criteria"], "hard_filters": hard_filters}
+
+
+def generate_interview_questions(client, candidate, role_title):
+    """
+    Generates probing interview questions targeted at this candidate's specific
+    weak or uncertain criteria (score <= 3) and any unresolved hard-filter flags —
+    not generic questions, but ones aimed at what scoring couldn't confirm.
+    """
+    weak_points = [s for s in candidate["scores"] if s["score"] <= 3]
+    filter_flags = [f for f in candidate.get("filter_results", []) if f["status"] != "met"]
+
+    if not weak_points and not filter_flags:
+        weak_points = candidate["scores"]  # strong candidate — still probe the top criteria to verify depth
+
+    prompt = f"""You are helping a hiring manager prepare for an interview with a
+candidate for the role of {role_title}.
+
+Below are the areas of this candidate's profile that scored low or were uncertain
+during CV screening, plus any eligibility items that couldn't be confirmed from the
+CV alone. Generate one targeted, specific interview question for each — designed to
+get concrete evidence in the room, not just re-ask what the CV already says.
+
+Uncertain or weak scoring areas:
+{json.dumps(weak_points, indent=2)}
+
+Unresolved eligibility flags:
+{json.dumps(filter_flags, indent=2)}
+
+For each question, also describe what a STRONG answer would sound like (specific,
+concrete, demonstrates real ownership or experience) and what a WEAK answer would
+sound like (vague, deflects to "the team," can't provide a concrete example, or
+contradicts the CV).
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "questions": [
+    {{
+      "topic": "which scoring area or flag this targets",
+      "question": "...",
+      "strong_answer_signal": "...",
+      "weak_answer_signal": "..."
+    }}
+  ]
+}}"""
+    response = client.messages.create(model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
+    return _extract_json(response.content[0].text)["questions"]
 
 
 def answer_question(client, question, candidates_bundle, role_title, history=None):
