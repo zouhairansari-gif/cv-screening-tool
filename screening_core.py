@@ -368,15 +368,13 @@ Candidate data:
 
 def generate_golden_profile(client, role_title, jd_text, criteria, hard_filters):
     """
-    Generates a holistic 'ideal candidate' narrative for the role — complementary
-    to the criterion-by-criterion rubric, not a replacement for it. Captures the
-    shape of a strong career (trajectory, scale, scope) that a list of independent
-    criterion scores can't express on its own.
+    Generates a holistic 'ideal candidate' snapshot for the role — complementary
+    to the criterion-by-criterion rubric, not a replacement for it. Deliberately
+    kept short: this is meant to be scanned in seconds, not read as a report.
     """
     prompt = f"""You are an experienced HR / talent acquisition partner. Based on the
 job description and screening rubric below, describe the ideal ("golden") candidate
-profile for this role — not a checklist, but the shape of a genuinely strong career
-for this specific role.
+profile for this role.
 
 Role: {role_title}
 
@@ -389,21 +387,33 @@ Screening rubric (for context on what already matters):
 Hard eligibility requirements:
 {json.dumps(hard_filters, indent=2)}
 
+BE EXTREMELY CONCISE. This will be read by busy recruiters scanning quickly, not
+read as a report. Follow these limits strictly:
+- "summary": ONE sentence, maximum 20 words. No sub-clauses stacked together.
+- "key_indicators": maximum 4 bullets, each a short phrase of 6-10 words, not a full sentence.
+- "red_flags": maximum 3 bullets, each a short phrase of 6-10 words, not a full sentence.
+
 Return ONLY valid JSON in this exact shape:
 {{
-  "summary": "2-4 sentences describing the ideal candidate's career shape, trajectory, and scope",
-  "key_indicators": ["specific, concrete signals of a strong match", "..."],
-  "red_flags": ["specific things that would be a concern for this role", "..."]
+  "summary": "...",
+  "key_indicators": ["...", "..."],
+  "red_flags": ["...", "..."]
 }}"""
-    response = client.messages.create(model=MODEL, max_tokens=1200, messages=[{"role": "user", "content": prompt}])
-    return _extract_json(response.content[0].text)
+    response = client.messages.create(model=MODEL, max_tokens=600, messages=[{"role": "user", "content": prompt}])
+    profile = _extract_json(response.content[0].text)
+    # Defensive cap regardless of whether the model followed the limits —
+    # keeps this crisp even if a response comes back longer than asked.
+    profile["key_indicators"] = profile.get("key_indicators", [])[:4]
+    profile["red_flags"] = profile.get("red_flags", [])[:3]
+    return profile
 
 
 def compare_candidate_to_golden_profile(client, candidate, golden_profile, role_title):
     """
-    Compares one candidate's actual CV against the golden profile narrative —
-    a holistic judgment, distinct from (and complementary to) the per-criterion
-    rubric scores this candidate already has.
+    Compares one candidate's actual CV against the golden profile — a holistic
+    judgment, distinct from (and complementary to) the per-criterion rubric
+    scores this candidate already has. Deliberately kept short: a scannable
+    fit-level tag plus a few short bullets, not a written comparison.
     """
     prompt = f"""You are comparing a candidate's CV against an ideal ("golden") profile
 for the role of {role_title}.
@@ -414,19 +424,27 @@ Golden profile:
 Candidate CV text:
 {candidate['cv_text'][:12000]}
 
-Judge the OVERALL shape of this candidate's career against the golden profile — not
-just individual facts, but trajectory, scale, and scope. Be specific and cite CV
-evidence; never invent details not present in the CV.
+Judge the OVERALL shape of this candidate's career against the golden profile. Cite
+CV evidence; never invent details not present in the CV.
+
+BE EXTREMELY CONCISE. This will be scanned quickly by a recruiter, not read as a
+report. Follow these limits strictly:
+- "one_liner": ONE short sentence, maximum 15 words.
+- "matches": maximum 3 bullets, each a short phrase of 6-10 words.
+- "gaps": maximum 3 bullets, each a short phrase of 6-10 words.
 
 Return ONLY valid JSON in this exact shape:
 {{
   "fit_level": "Strong", "Moderate", or "Weak",
-  "matches": ["specific ways this candidate matches the golden profile", "..."],
-  "gaps": ["specific ways this candidate falls short of the golden profile", "..."],
-  "narrative": "2-3 sentences summarizing the overall comparison"
+  "one_liner": "...",
+  "matches": ["...", "..."],
+  "gaps": ["...", "..."]
 }}"""
-    response = client.messages.create(model=MODEL, max_tokens=1200, messages=[{"role": "user", "content": prompt}])
-    return _extract_json(response.content[0].text)
+    response = client.messages.create(model=MODEL, max_tokens=600, messages=[{"role": "user", "content": prompt}])
+    comparison = _extract_json(response.content[0].text)
+    comparison["matches"] = comparison.get("matches", [])[:3]
+    comparison["gaps"] = comparison.get("gaps", [])[:3]
+    return comparison
 
 
 def normalize_weights(criteria):
@@ -521,7 +539,7 @@ def generate_candidate_pdf(candidate, role_title, criteria, golden_profile=None,
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, _pdf_safe(f"Golden profile fit: {comp['fit_level']}"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, _pdf_safe(comp["narrative"]), new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 6, _pdf_safe(comp["one_liner"]), new_x="LMARGIN", new_y="NEXT")
         if comp.get("matches"):
             pdf.set_font("Helvetica", "B", 10)
             pdf.cell(0, 6, "Matches:", new_x="LMARGIN", new_y="NEXT")
