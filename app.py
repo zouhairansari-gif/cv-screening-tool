@@ -157,15 +157,16 @@ with tab_setup:
 
         if data.get("golden_profile"):
             gp = data["golden_profile"]
-            st.markdown(f"**Summary:** {gp['summary']}")
-            if gp.get("key_indicators"):
-                st.markdown("**Key indicators of a strong fit:**")
-                for k in gp["key_indicators"]:
-                    st.markdown(f"- {k}")
-            if gp.get("red_flags"):
-                st.markdown("**Red flags to watch for:**")
-                for r in gp["red_flags"]:
-                    st.markdown(f"- {r}")
+            st.markdown(f"💡 *{gp['summary']}*")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if gp.get("key_indicators"):
+                    st.markdown("**✅ Strong-fit signals**")
+                    st.markdown("\n".join(f"- {k}" for k in gp["key_indicators"]))
+            with col_b:
+                if gp.get("red_flags"):
+                    st.markdown("**🚩 Red flags**")
+                    st.markdown("\n".join(f"- {r}" for r in gp["red_flags"]))
 
         st.divider()
         st.subheader("Add your own requirements (optional)")
@@ -294,12 +295,13 @@ with tab_shortlist:
 
                 if c.get("golden_profile_comparison"):
                     comp = c["golden_profile_comparison"]
+                    fit_icon = {"Strong": "🟢", "Moderate": "🟡", "Weak": "🔴"}.get(comp["fit_level"], "⚪")
                     st.markdown("---")
-                    st.markdown(f"**Golden profile fit: {comp['fit_level']}**  \n{comp['narrative']}")
+                    st.markdown(f"{fit_icon} **Golden profile fit: {comp['fit_level']}** — {comp['one_liner']}")
                     if comp.get("matches"):
                         st.markdown("✅ " + " · ".join(comp["matches"]))
                     if comp.get("gaps"):
-                        st.markdown("❌ " + " · ".join(comp["gaps"]))
+                        st.markdown("🚩 " + " · ".join(comp["gaps"]))
 
                 st.markdown("---")
                 pdf_bytes = sc.generate_candidate_pdf(
