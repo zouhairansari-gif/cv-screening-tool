@@ -242,6 +242,93 @@ Return ONLY valid JSON in this exact shape:
     return _extract_json(response.content[0].text)
 
 
+def extract_glossary(client, jd_text):
+    """
+    Pulls jargon, acronyms, and industry-specific terms out of a JD that a
+    generalist recruiter likely wouldn't know, each with a short plain-English
+    definition. Capped so it stays a quick reference, not another report.
+    """
+    prompt = f"""You are helping a generalist HR recruiter (not a subject-matter expert
+in this field) understand a job description before they screen candidates against it.
+
+Job description:
+{jd_text}
+
+Identify up to 8 technical terms, acronyms, or industry jargon in this JD that a
+generalist recruiter likely would NOT already know (e.g. "RTM", "cost-to-serve",
+"EBITDA"). Skip common business terms any recruiter already knows (e.g. "manager",
+"stakeholder", "team", "budget").
+
+For each term, give a short, plain-English definition — maximum 20 words — and the
+definition itself must not use further jargon.
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "glossary": [
+    {{"term": "...", "definition": "..."}}
+  ]
+}}
+(Return an empty list if the JD has no notable jargon.)"""
+    response = client.messages.create(model=MODEL, max_tokens=800, messages=[{"role": "user", "content": prompt}])
+    result = _extract_json(response.content[0].text)
+    return result.get("glossary", [])[:8]  # defensive cap regardless of model compliance
+
+
+def rescore_with_comments(client, candidate, criteria, hard_filters, comments):
+    """
+    Re-scores a candidate using the original CV plus recruiter comments (e.g.
+    interview notes, reference-check findings, corrections) as additional
+    evidence. The rationale explicitly flags when a comment changed the
+    assessment, so a score never shifts without a visible trail explaining why.
+    """
+    comments_text = "\n".join(f"- {c['text']}" for c in comments if c.get("text", "").strip())
+
+    filters_block = ""
+    if hard_filters:
+        filters_block = f"""
+
+Also re-evaluate these hard eligibility requirements the same way — weighing both
+the CV and the recruiter notes:
+{json.dumps(hard_filters, indent=2)}
+For EACH, return a status of "met", "not_met", or "cannot_determine", with a
+rationale. Apply the same rule as before for work authorization, visa, or
+nationality — judge ONLY from explicit statements in the CV or recruiter notes,
+NEVER inferred from a name or any other proxy."""
+
+    prompt = f"""You are re-scoring a candidate against a weighted hiring rubric, now
+that the recruiter has added notes from interviews, reference checks, or other
+verification — not just the original CV.
+
+Rubric criteria:
+{json.dumps(criteria, indent=2)}
+
+Original CV text:
+{candidate['cv_text'][:12000]}
+
+Recruiter notes (interview findings, verification, corrections):
+{comments_text}
+
+Weigh the recruiter notes as authoritative additional evidence — they can confirm,
+contradict, or add to what the CV alone shows. For EACH criterion, return an updated
+score (1-5) and a rationale. If a recruiter note changed your assessment from what
+the CV alone would suggest, say so explicitly (e.g. "Revised down: recruiter
+interview note indicates candidate could not provide a specific example").
+{filters_block}
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "scores": [
+    {{"criterion": "...", "score": 1, "rationale": "..."}}
+  ],
+  "filter_results": [
+    {{"filter": "...", "status": "met", "rationale": "..."}}
+  ]
+}}
+(Return an empty list for filter_results if no hard requirements were provided.)"""
+    response = client.messages.create(model=MODEL, max_tokens=1800, messages=[{"role": "user", "content": prompt}])
+    return _extract_json(response.content[0].text)
+
+
 def merge_requirements_into_rubric(client, role_title, base_criteria, requirements):
     """
     Takes the JD-derived rubric (base_criteria) plus a recruiter's explicit
@@ -300,48 +387,52 @@ Return ONLY valid JSON in this exact shape:
 
 def generate_interview_questions(client, candidate, role_title):
     """
-    Generates probing interview questions targeted at this candidate's specific
-    weak or uncertain criteria (score <= 3) and any unresolved hard-filter flags —
-    not generic questions, but ones aimed at what scoring couldn't confirm.
+    Generates probing interview questions targeted at this candidate's most
+    consequential weak or uncertain areas — capped at 4 total, kept short
+    enough to actually use in an interview, not a report to read beforehand.
     """
-    weak_points = [s for s in candidate["scores"] if s["score"] <= 3]
+    sorted_scores = sorted(candidate["scores"], key=lambda s: s["score"])
+    weak_points = sorted_scores[:3]  # the 3 lowest-scoring criteria — most consequential gaps first
     filter_flags = [f for f in candidate.get("filter_results", []) if f["status"] != "met"]
 
-    if not weak_points and not filter_flags:
-        weak_points = candidate["scores"]  # strong candidate — still probe the top criteria to verify depth
+    if all(s["score"] >= 4 for s in candidate["scores"]) and not filter_flags:
+        # Strong candidate with nothing to probe defensively — verify depth on
+        # the top criteria instead of taking a high score on faith.
+        weak_points = sorted(candidate["scores"], key=lambda s: -s["score"])[:2]
+
+    topics = (weak_points + filter_flags)[:4]  # cap input topics so output naturally stays short
 
     prompt = f"""You are helping a hiring manager prepare for an interview with a
 candidate for the role of {role_title}.
 
-Below are the areas of this candidate's profile that scored low or were uncertain
-during CV screening, plus any eligibility items that couldn't be confirmed from the
-CV alone. Generate one targeted, specific interview question for each — designed to
-get concrete evidence in the room, not just re-ask what the CV already says.
+Below are the specific areas of this candidate's profile to probe — either scoring
+gaps or eligibility items that couldn't be confirmed from the CV alone. Generate ONE
+targeted interview question per area, designed to get concrete evidence in the room,
+not just re-ask what the CV already says.
 
-Uncertain or weak scoring areas:
-{json.dumps(weak_points, indent=2)}
+Areas to probe:
+{json.dumps(topics, indent=2)}
 
-Unresolved eligibility flags:
-{json.dumps(filter_flags, indent=2)}
-
-For each question, also describe what a STRONG answer would sound like (specific,
-concrete, demonstrates real ownership or experience) and what a WEAK answer would
-sound like (vague, deflects to "the team," can't provide a concrete example, or
-contradicts the CV).
+BE EXTREMELY CONCISE — this is a quick reference the interviewer glances at, not a
+report to read beforehand. Follow these limits strictly:
+- "question": ONE sentence, maximum 20 words.
+- "strong_answer_signal": short phrase, maximum 10 words.
+- "weak_answer_signal": short phrase, maximum 10 words.
 
 Return ONLY valid JSON in this exact shape:
 {{
   "questions": [
     {{
-      "topic": "which scoring area or flag this targets",
+      "topic": "which area this targets",
       "question": "...",
       "strong_answer_signal": "...",
       "weak_answer_signal": "..."
     }}
   ]
 }}"""
-    response = client.messages.create(model=MODEL, max_tokens=2500, messages=[{"role": "user", "content": prompt}])
-    return _extract_json(response.content[0].text)["questions"]
+    response = client.messages.create(model=MODEL, max_tokens=1200, messages=[{"role": "user", "content": prompt}])
+    questions = _extract_json(response.content[0].text)["questions"]
+    return questions[:4]  # defensive cap regardless of model compliance
 
 
 def answer_question(client, question, candidates_bundle, role_title, history=None):
