@@ -459,13 +459,17 @@ Candidate data:
 
 def generate_golden_profile(client, role_title, jd_text, criteria, hard_filters):
     """
-    Generates a holistic 'ideal candidate' snapshot for the role — complementary
-    to the criterion-by-criterion rubric, not a replacement for it. Deliberately
-    kept short: this is meant to be scanned in seconds, not read as a report.
+    Generates a structured 'ideal candidate' profile for the role — organized
+    into concrete, labeled categories (not a loose paragraph) so a recruiter
+    can source and screen against specifics: what education/certs to look for,
+    what industry background, which companies and job titles tend to produce
+    strong candidates, and what concrete evidence separates strong from weak.
+    Every category is capped short — this is a scan-in-seconds reference,
+    not a report.
     """
-    prompt = f"""You are an experienced HR / talent acquisition partner. Based on the
-job description and screening rubric below, describe the ideal ("golden") candidate
-profile for this role.
+    prompt = f"""You are an experienced HR / talent acquisition partner with deep
+knowledge of this industry. Based on the job description and screening rubric below,
+build a structured "ideal candidate" profile for this role.
 
 Role: {role_title}
 
@@ -478,36 +482,60 @@ Screening rubric (for context on what already matters):
 Hard eligibility requirements:
 {json.dumps(hard_filters, indent=2)}
 
-BE EXTREMELY CONCISE. This will be read by busy recruiters scanning quickly, not
-read as a report. Follow these limits strictly:
-- "summary": ONE sentence, maximum 20 words. No sub-clauses stacked together.
-- "key_indicators": maximum 4 bullets, each a short phrase of 6-10 words, not a full sentence.
-- "red_flags": maximum 3 bullets, each a short phrase of 6-10 words, not a full sentence.
+Be concrete and specific — real qualifications, real company names, real job titles
+that would actually appear on a strong candidate's CV for this role and industry.
+If a category genuinely doesn't apply to this role (e.g. certifications aren't
+typically relevant), return an empty list for it rather than inventing filler.
+
+BE EXTREMELY CONCISE. This will be scanned quickly by a recruiter, not read as a
+report. Follow these limits strictly:
+- "summary": ONE sentence, maximum 20 words.
+- "ideal_education": max 2 short bullets (degree level/field).
+- "ideal_certifications": max 2 short bullets (leave empty if not relevant to this role).
+- "ideal_industry_experience": max 3 short bullets (specific sub-sector, years, scope).
+- "targeted_companies": max 5 real, specific company names a strong candidate is
+  likely to have worked at, relevant to this role's industry and region.
+- "targeted_similar_roles": max 4 short job titles that map well to this role.
+- "evidence_of_strong_experience": max 4 short, concrete phrases describing what a
+  strong CV actually shows (not vague traits — specific accomplishments/scope).
+- "red_flags": max 3 short bullets.
+Each bullet: 4-10 words, not a full sentence.
 
 Return ONLY valid JSON in this exact shape:
 {{
   "summary": "...",
-  "key_indicators": ["...", "..."],
+  "ideal_education": ["...", "..."],
+  "ideal_certifications": ["...", "..."],
+  "ideal_industry_experience": ["...", "..."],
+  "targeted_companies": ["...", "..."],
+  "targeted_similar_roles": ["...", "..."],
+  "evidence_of_strong_experience": ["...", "..."],
   "red_flags": ["...", "..."]
 }}"""
-    response = client.messages.create(model=MODEL, max_tokens=600, messages=[{"role": "user", "content": prompt}])
+    response = client.messages.create(model=MODEL, max_tokens=1000, messages=[{"role": "user", "content": prompt}])
     profile = _extract_json(response.content[0].text)
-    # Defensive cap regardless of whether the model followed the limits —
+    # Defensive caps regardless of whether the model followed the limits —
     # keeps this crisp even if a response comes back longer than asked.
-    profile["key_indicators"] = profile.get("key_indicators", [])[:4]
-    profile["red_flags"] = profile.get("red_flags", [])[:3]
+    caps = {
+        "ideal_education": 2, "ideal_certifications": 2, "ideal_industry_experience": 3,
+        "targeted_companies": 5, "targeted_similar_roles": 4,
+        "evidence_of_strong_experience": 4, "red_flags": 3,
+    }
+    for field, limit in caps.items():
+        profile[field] = profile.get(field, [])[:limit]
     return profile
 
 
 def compare_candidate_to_golden_profile(client, candidate, golden_profile, role_title):
     """
-    Compares one candidate's actual CV against the golden profile — a holistic
-    judgment, distinct from (and complementary to) the per-criterion rubric
-    scores this candidate already has. Deliberately kept short: a scannable
-    fit-level tag plus a few short bullets, not a written comparison.
+    Compares one candidate's actual CV against the structured golden profile —
+    checking specifically against its labeled categories (education, industry
+    experience, target companies, target roles, evidence) rather than a vague
+    overall impression. Deliberately kept short: a scannable fit-level tag plus
+    a few short bullets, not a written comparison.
     """
-    prompt = f"""You are comparing a candidate's CV against an ideal ("golden") profile
-for the role of {role_title}.
+    prompt = f"""You are comparing a candidate's CV against a structured ideal
+("golden") candidate profile for the role of {role_title}.
 
 Golden profile:
 {json.dumps(golden_profile, indent=2)}
@@ -515,13 +543,17 @@ Golden profile:
 Candidate CV text:
 {candidate['cv_text'][:12000]}
 
-Judge the OVERALL shape of this candidate's career against the golden profile. Cite
-CV evidence; never invent details not present in the CV.
+Check the candidate specifically against the golden profile's categories: education,
+certifications, industry experience, target companies (did they work at one of the
+listed companies or a clear peer?), target similar roles (did they hold one of these
+titles or equivalent?), and the concrete evidence markers. Cite CV evidence; never
+invent details not present in the CV.
 
 BE EXTREMELY CONCISE. This will be scanned quickly by a recruiter, not read as a
 report. Follow these limits strictly:
 - "one_liner": ONE short sentence, maximum 15 words.
-- "matches": maximum 3 bullets, each a short phrase of 6-10 words.
+- "matches": maximum 3 bullets, each a short phrase of 6-10 words, naming which
+  category it satisfies where relevant (e.g. "Worked at Unilever, a target company").
 - "gaps": maximum 3 bullets, each a short phrase of 6-10 words.
 
 Return ONLY valid JSON in this exact shape:
