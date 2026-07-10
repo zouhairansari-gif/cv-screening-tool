@@ -196,15 +196,34 @@ def render_workspace(client, project_id):
         if data.get("golden_profile"):
             gp = data["golden_profile"]
             st.markdown(f"💡 *{gp['summary']}*")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if gp.get("key_indicators"):
-                    st.markdown("**✅ Strong-fit signals**")
-                    st.markdown("\n".join(f"- {k}" for k in gp["key_indicators"]))
-            with col_b:
-                if gp.get("red_flags"):
-                    st.markdown("**🚩 Red flags**")
-                    st.markdown("\n".join(f"- {r}" for r in gp["red_flags"]))
+
+            row1 = st.columns(3)
+            with row1[0]:
+                st.markdown("**🎓 Education & certifications**")
+                items = gp.get("ideal_education", []) + gp.get("ideal_certifications", [])
+                st.markdown("\n".join(f"- {x}" for x in items) if items else "_Not specified_")
+            with row1[1]:
+                st.markdown("**🏭 Industry experience**")
+                items = gp.get("ideal_industry_experience", [])
+                st.markdown("\n".join(f"- {x}" for x in items) if items else "_Not specified_")
+            with row1[2]:
+                st.markdown("**🏢 Target companies**")
+                items = gp.get("targeted_companies", [])
+                st.markdown("\n".join(f"- {x}" for x in items) if items else "_Not specified_")
+
+            row2 = st.columns(2)
+            with row2[0]:
+                st.markdown("**💼 Similar roles to target**")
+                items = gp.get("targeted_similar_roles", [])
+                st.markdown("\n".join(f"- {x}" for x in items) if items else "_Not specified_")
+            with row2[1]:
+                st.markdown("**✅ Evidence of strong experience**")
+                items = gp.get("evidence_of_strong_experience", [])
+                st.markdown("\n".join(f"- {x}" for x in items) if items else "_Not specified_")
+
+            if gp.get("red_flags"):
+                st.markdown("**🚩 Red flags**")
+                st.markdown("\n".join(f"- {r}" for r in gp["red_flags"]))
 
         st.divider()
         st.subheader("Add your own requirements (optional)")
